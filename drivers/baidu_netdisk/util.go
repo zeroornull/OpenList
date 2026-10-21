@@ -101,7 +101,11 @@ func (d *BaiduNetdisk) request(furl string, method string, callback base.ReqCall
 func (d *BaiduNetdisk) requestCtx(ctx context.Context, furl string, method string, callback base.ReqCallback, resp interface{}) ([]byte, error) {
 	var body []byte
 	var waited time.Duration
+	attempt := 0
+	reqStart := time.Now()
+	var apiMethod, apiOpera string
 	err := retry.Do(func() error {
+		attempt++
 		// Wait for the shared rate-limit breaker, but never longer than the
 		// per-call budget in total.
 		p, w, ok, err := d.cooldown.acquire(ctx, d.cooldown.budget()-waited)
@@ -110,6 +114,9 @@ func (d *BaiduNetdisk) requestCtx(ctx context.Context, furl string, method strin
 			return retry.Unrecoverable(err)
 		}
 		if !ok {
+			// [pending-debug] diagnostic only
+			log.Warnf("[baidu-debug] cooldown budget exhausted: method=%s opera=%s attempt=%d/3 waited=%s elapsed=%s",
+				apiMethod, apiOpera, attempt, waited.Truncate(time.Millisecond), time.Since(reqStart).Truncate(time.Millisecond))
 			return retry.Unrecoverable(&apiError{URL: furl, Errno: errnoRateLimited})
 		}
 		result := outcomeOther
@@ -122,8 +129,12 @@ func (d *BaiduNetdisk) requestCtx(ctx context.Context, furl string, method strin
 		if resp != nil {
 			req.SetResult(resp)
 		}
+		apiMethod, apiOpera = req.QueryParam.Get("method"), req.QueryParam.Get("opera")
 		res, err := req.Execute(method, furl)
 		if err != nil {
+			// [pending-debug] diagnostic only
+			log.Warnf("[baidu-debug] req failed: method=%s opera=%s attempt=%d/3 elapsed=%s err=%v",
+				apiMethod, apiOpera, attempt, time.Since(reqStart).Truncate(time.Millisecond), err)
 			if ctx.Err() != nil {
 				return retry.Unrecoverable(ctx.Err())
 			}
@@ -131,6 +142,15 @@ func (d *BaiduNetdisk) requestCtx(ctx context.Context, furl string, method strin
 		}
 		log.Debugf("[baidu_netdisk] req: %s, resp: %s", furl, res.String())
 		apiErr := parseAPIError(furl, res.Body())
+		if apiErr != nil {
+			// [pending-debug] diagnostic only; the body never contains the access token
+			log.Warnf("[baidu-debug] req errno: method=%s opera=%s attempt=%d/3 errno=%d rate_limited=%v not_exist=%v waited=%s elapsed=%s http=%d resp=%s",
+				apiMethod, apiOpera, attempt, apiErr.Errno, apiErr.RateLimited(), apiErr.NotExist(), waited.Truncate(time.Millisecond),
+				time.Since(reqStart).Truncate(time.Millisecond), res.StatusCode(), debugTrunc(res.String(), 600))
+		} else if attempt > 1 {
+			log.Warnf("[baidu-debug] req succeeded after retry: method=%s opera=%s attempt=%d/3 waited=%s elapsed=%s resp=%s",
+				apiMethod, apiOpera, attempt, waited.Truncate(time.Millisecond), time.Since(reqStart).Truncate(time.Millisecond), debugTrunc(res.String(), 600))
+		}
 		if apiErr == nil {
 			result = outcomeSuccess
 			body = res.Body()
@@ -530,4 +550,22 @@ func EncryptMd5(originalMd5 string) string {
 		}
 	}
 	return out.String()
+}
+
+// debugTrunc shortens s for diagnostic logs.
+func debugTrunc(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n] + "...(truncated)"
+}
+
+// debugFileSummary describes a Baidu file record for diagnostic logs.
+func debugFileSummary(f File) string {
+	return fmt.Sprintf("fs_id=%d path=%q server_filename=%q size=%d", f.FsId, f.Path, f.ServerFilename, f.Size)
+}
+
+// debugFileIncomplete reports whether a create/precreate result lacks the fields used to build the returned object.
+func debugFileIncomplete(f File) bool {
+	return f.FsId == 0 || f.Path == "" || f.ServerFilename == ""
 }

@@ -161,11 +161,16 @@ func (d *BaiduNetdisk) Copy(ctx context.Context, srcObj, dstDir model.Obj) error
 
 func (d *BaiduNetdisk) Remove(ctx context.Context, obj model.Obj) error {
 	data := []string{obj.GetPath()}
+	start := time.Now()
 	_, err := d.manage(ctx, "delete", data)
 	if e, ok := asAPIError(err); ok && e.NotExist() {
 		// already gone: deleting is idempotent
 		log.Debugf("[baidu_netdisk] %s already removed (errno %d)", obj.GetPath(), e.Errno)
 		return nil
+	}
+	if err != nil {
+		// [pending-debug] per-attempt errno and response body are logged by requestCtx()
+		log.Warnf("[baidu-debug] delete failed: files=%d first=%q elapsed=%s err=%v", len(data), obj.GetPath(), time.Since(start).Truncate(time.Millisecond), err)
 	}
 	return err
 }
@@ -183,9 +188,13 @@ func (d *BaiduNetdisk) PutRapid(ctx context.Context, dstDir model.Obj, stream mo
 	blockList, _ := utils.Json.MarshalToString([]string{contentMd5})
 
 	var newFile File
-	_, err := d.create(path, streamSize, 0, "", blockList, &newFile, mtime, ctime)
+	raw, err := d.create(path, streamSize, 0, "", blockList, &newFile, mtime, ctime)
 	if err != nil {
 		return nil, err
+	}
+	if debugFileIncomplete(newFile) || newFile.Path != path {
+		log.Warnf("[baidu-debug] rapid-upload create result incomplete or path differs: requested=%q %s resp=%s",
+			path, debugFileSummary(newFile), debugTrunc(string(raw), 600))
 	}
 	// 修复时间，具体原因见 Put 方法注释的 **注意**
 	newFile.Ctime = stream.CreateTime().Unix()
@@ -290,6 +299,8 @@ func (d *BaiduNetdisk) Put(ctx context.Context, dstDir model.Obj, stream model.F
 			return nil, err
 		}
 		if precreateResp.ReturnType == 2 {
+			log.Warnf("[baidu-debug] precreate return_type=2 (rapid): requested=%q %s incomplete=%v",
+				path, debugFileSummary(precreateResp.File), debugFileIncomplete(precreateResp.File))
 			// rapid upload, since got md5 match from baidu server
 			// 修复时间，具体原因见 Put 方法注释的 **注意**
 			precreateResp.File.Ctime = ctime
@@ -375,6 +386,8 @@ uploadLoop:
 				return nil, err2
 			}
 			if newPre.ReturnType == 2 {
+				log.Warnf("[baidu-debug] re-precreate return_type=2 (rapid) after uploadid expired: requested=%q %s incomplete=%v",
+					path, debugFileSummary(newPre.File), debugFileIncomplete(newPre.File))
 				return fileToObj(newPre.File), nil
 			}
 			precreateResp = newPre
@@ -389,9 +402,15 @@ uploadLoop:
 
 	// step.3 创建文件
 	var newFile File
-	_, err = d.create(path, streamSize, 0, precreateResp.Uploadid, blockListStr, &newFile, mtime, ctime)
+	createStart := time.Now()
+	raw, err := d.create(path, streamSize, 0, precreateResp.Uploadid, blockListStr, &newFile, mtime, ctime)
 	if err != nil {
+		log.Warnf("[baidu-debug] create failed: requested=%q size=%d elapsed=%s err=%v", path, streamSize, time.Since(createStart).Truncate(time.Millisecond), err)
 		return nil, err
+	}
+	if debugFileIncomplete(newFile) || newFile.Path != path {
+		log.Warnf("[baidu-debug] create result incomplete or path differs: requested=%q size=%d %s elapsed=%s resp=%s",
+			path, streamSize, debugFileSummary(newFile), time.Since(createStart).Truncate(time.Millisecond), debugTrunc(string(raw), 600))
 	}
 	// 修复时间，具体原因见 Put 方法注释的 **注意**
 	newFile.Ctime = ctime

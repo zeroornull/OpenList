@@ -119,6 +119,7 @@ func (b *s3Backend) HeadObject(ctx context.Context, bucketName, objectName strin
 	fmeta, _ := op.GetNearestMeta(fp)
 	node, err := fs.Get(context.WithValue(ctx, conf.MetaKey, fmeta), fp, &fs.GetArgs{})
 	if err != nil {
+		logNotFoundPending("HEAD", fp, objectName, err)
 		return nil, gofakes3.KeyNotFound(objectName)
 	}
 
@@ -164,6 +165,7 @@ func (b *s3Backend) GetObject(ctx context.Context, bucketName, objectName string
 	fmeta, _ := op.GetNearestMeta(fp)
 	node, err := fs.Get(context.WithValue(ctx, conf.MetaKey, fmeta), fp, &fs.GetArgs{})
 	if err != nil {
+		logNotFoundPending("GET", fp, objectName, err)
 		return nil, gofakes3.KeyNotFound(objectName)
 	}
 
@@ -457,4 +459,20 @@ func (b *s3Backend) CopyObject(ctx context.Context, srcBucket, srcKey, dstBucket
 		ETag:         `"` + hex.EncodeToString(c.Hash) + `"`,
 		LastModified: gofakes3.NewContentTime(srcNode.ModTime()),
 	}, nil
+}
+
+// logNotFoundPending logs a 404 for a key whose directory has pending-add
+// records, so a name mismatch between the write and the lookup is visible.
+// Diagnostic only ([pending-debug]).
+func logNotFoundPending(op_ string, fp, objectName string, getErr error) {
+	storage, actualPath, err := op.GetStorageAndActualPath(fp)
+	if err != nil {
+		return
+	}
+	near := op.PendingDebugSummary(storage, actualPath, 5)
+	if len(near) == 0 {
+		return
+	}
+	log.Warnf("[pending-debug] s3 %s 404 with pending entries in dir: key=%q path=%q err=%v pending=%v",
+		op_, objectName, fp, getErr, near)
 }

@@ -635,6 +635,15 @@ func Remove(ctx context.Context, storage driver.Driver, path string) error {
 }
 
 func Put(ctx context.Context, storage driver.Driver, dstDirPath string, file model.FileStreamer, up driver.UpdateProgress) error {
+	putStart := time.Now()
+	requestedName := file.GetName()
+	defer func() {
+		// [pending-debug] diagnostic only
+		if el := time.Since(putStart); el > 8*time.Second {
+			log.Warnf("[pending-debug] slow put: storage=%s dir=%s name=%q size=%d elapsed=%s",
+				storage.GetStorage().MountPath, dstDirPath, requestedName, file.GetSize(), el.Truncate(time.Millisecond))
+		}
+	}()
 	defer func() {
 		if err := file.Close(); err != nil {
 			log.Errorf("failed to close file streamer, %v", err)
@@ -704,6 +713,14 @@ func Put(ctx context.Context, storage driver.Driver, dstDirPath string, file mod
 		return errs.NotImplement
 	}
 	if err == nil {
+		// [pending-debug] diagnostic only: the driver returned an object whose name differs from the requested one
+		if newObj != nil {
+			if rn := newObj.GetName(); rn != requestedName || rn == "" || rn == "." {
+				log.Warnf("[pending-debug] put returned name mismatch: storage=%s requested=%q returned_name=%q returned_path=%q size=%d returned_size=%d pending_key=%q",
+					storage.GetStorage().MountPath, dstPath, rn, newObj.GetPath(), file.GetSize(), newObj.GetSize(),
+					stdpath.Join(Key(storage, dstDirPath), rn))
+			}
+		}
 		Cache.linkCache.DeleteKey(Key(storage, dstPath))
 		if !storage.Config().NoCache {
 			if newObj == nil {
